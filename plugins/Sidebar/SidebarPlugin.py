@@ -65,12 +65,20 @@ class UiRequestPlugin(object):
 
 @PluginManager.registerTo("UiWebsocket")
 class UiWebsocketPlugin(object):
-
     def sidebarRenderPeerStats(self, body, site):
         connected = len([peer for peer in site.peers.values() if peer.connection and peer.connection.connected])
         connectable = len([peer_id for peer_id in site.peers.keys() if not peer_id.endswith(":0")])
         onion = len([peer_id for peer_id in site.peers.keys() if ".onion" in peer_id])
         peers_total = len(site.peers)
+
+        # Add myself
+        if site.settings["serving"]:
+            peers_total += 1
+            if site.connection_server.port_opened:
+                connectable += 1
+            if site.connection_server.tor_manager.start_onions:
+                onion += 1
+
         if peers_total:
             percent_connected = float(connected) / peers_total
             percent_connectable = float(connectable) / peers_total
@@ -409,6 +417,14 @@ class UiWebsocketPlugin(object):
         """))
 
         # Choose content you want to sign
+        body.append(_(u"""
+             <div class='flex'>
+              <input type='text' class='text' value="content.json" id='input-contents'/>
+              <a href='#Sign-and-Publish' id='button-sign-publish' class='button'>{_[Sign and publish]}</a>
+              <a href='#Sign-or-Publish' id='menu-sign-publish'>\u22EE</a>
+             </div>
+        """))
+
         contents = ["content.json"]
         contents += site.content_manager.contents.get("content.json", {}).get("includes", {}).keys()
         body.append(_(u"<div class='contents'>{_[Choose]}: "))
@@ -416,15 +432,7 @@ class UiWebsocketPlugin(object):
             content = cgi.escape(content, True)
             body.append(_("<a href='#{content}' onclick='$(\"#input-contents\").val(\"{content}\"); return false'>{content}</a> "))
         body.append("</div>")
-
-        body.append(_(u"""
-             <div class='flex'>
-              <input type='text' class='text' value="content.json" id='input-contents'/>
-              <a href='#Sign' class='button' id='button-sign'>{_[Sign]}</a>
-              <a href='#Publish' class='button' id='button-publish'>{_[Publish]}</a>
-             </div>
-            </li>
-        """))
+        body.append("</li>")
 
     def actionSidebarGetHtmlTag(self, to):
         site = self.site
@@ -432,6 +440,7 @@ class UiWebsocketPlugin(object):
         body = []
 
         body.append("<div>")
+        body.append("<a href='#Close' class='close'>&times;</a>")
         body.append("<h1>%s</h1>" % cgi.escape(site.content_manager.contents.get("content.json", {}).get("title", ""), True))
 
         body.append("<div class='globe loading'></div>")
@@ -459,6 +468,10 @@ class UiWebsocketPlugin(object):
         body.append("</ul>")
         body.append("</div>")
 
+        body.append("<div class='menu template'>")
+        body.append("<a href='#'' class='menu-item template'>Template</a>")
+        body.append("</div>")
+
         self.response(to, "".join(body))
 
     def downloadGeoLiteDb(self, db_path):
@@ -468,7 +481,7 @@ class UiWebsocketPlugin(object):
         from util import helper
 
         self.log.info("Downloading GeoLite2 City database...")
-        self.cmd("notification", ["geolite-info", _["Downloading GeoLite2 City database (one time only, ~20MB)..."], 0])
+        self.cmd("progress", ["geolite-info", _["Downloading GeoLite2 City database (one time only, ~20MB)..."], 0])
         db_urls = [
             "https://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz",
             "https://raw.githubusercontent.com/texnikru/GeoLite2-Database/master/GeoLite2-City.mmdb.gz"
@@ -477,13 +490,18 @@ class UiWebsocketPlugin(object):
             try:
                 # Download
                 response = helper.httpRequest(db_url)
-
+                data_size = response.getheader('content-length')
+                data_recv = 0
                 data = StringIO.StringIO()
                 while True:
                     buff = response.read(1024 * 512)
                     if not buff:
                         break
                     data.write(buff)
+                    data_recv += 1024 * 512
+                    if data_size:
+                        progress = int(float(data_recv) / int(data_size) * 100)
+                        self.cmd("progress", ["geolite-info", _["Downloading GeoLite2 City database (one time only, ~20MB)..."], progress])
                 self.log.info("GeoLite2 City database downloaded (%s bytes), unpacking..." % data.tell())
                 data.seek(0)
 
@@ -491,78 +509,119 @@ class UiWebsocketPlugin(object):
                 with gzip.GzipFile(fileobj=data) as gzip_file:
                     shutil.copyfileobj(gzip_file, open(db_path, "wb"))
 
-                self.cmd("notification", ["geolite-done", _["GeoLite2 City database downloaded!"], 5000])
+                self.cmd("progress", ["geolite-info", _["GeoLite2 City database downloaded!"], 100])
                 time.sleep(2)  # Wait for notify animation
                 return True
-            except Exception, err:
+            except Exception as err:
                 self.log.error("Error downloading %s: %s" % (db_url, err))
                 pass
-        self.cmd("notification", [
-            "geolite-error",
+        self.cmd("progress", [
+            "geolite-info",
             _["GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}"].format(err, db_urls[0]),
-            0
+            -100
         ])
+
+    def getLoc(self, geodb, ip):
+        global loc_cache
+
+        if ip in loc_cache:
+            return loc_cache[ip]
+        else:
+            try:
+                loc_data = geodb.get(ip)
+            except:
+                loc_data = None
+
+            if not loc_data or "location" not in loc_data:
+                loc_cache[ip] = None
+                return None
+
+            loc = {
+                "lat": loc_data["location"]["latitude"],
+                "lon": loc_data["location"]["longitude"],
+            }
+            if "city" in loc_data:
+                loc["city"] = loc_data["city"]["names"]["en"]
+
+            if "country" in loc_data:
+                loc["country"] = loc_data["country"]["names"]["en"]
+
+            loc_cache[ip] = loc
+            return loc
+
+    def getPeerLocations(self, peers):
+        import maxminddb
+        db_path = config.data_dir + '/GeoLite2-City.mmdb'
+        if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
+            if not self.downloadGeoLiteDb(db_path):
+                return False
+        geodb = maxminddb.open_database(db_path)
+
+        peers = peers.values()
+        # Place bars
+        peer_locations = []
+        placed = {}  # Already placed bars here
+        for peer in peers:
+            # Height of bar
+            if peer.connection and peer.connection.last_ping_delay:
+                ping = round(peer.connection.last_ping_delay * 1000)
+            else:
+                ping = None
+            loc = self.getLoc(geodb, peer.ip)
+
+            if not loc:
+                continue
+            # Create position array
+            lat, lon = loc["lat"], loc["lon"]
+            latlon = "%s,%s" % (lat, lon)
+            if latlon in placed:  # Dont place more than 1 bar to same place, fake repos using ip address last two part
+                lat += float(128 - int(peer.ip.split(".")[-2])) / 50
+                lon += float(128 - int(peer.ip.split(".")[-1])) / 50
+                latlon = "%s,%s" % (lat, lon)
+            placed[latlon] = True
+            peer_location = {}
+            peer_location.update(loc)
+            peer_location["lat"] = lat
+            peer_location["lon"] = lon
+            peer_location["ping"] = ping
+
+            peer_locations.append(peer_location)
+
+        # Append myself
+        my_loc = self.getLoc(geodb, config.ip_external)
+        if my_loc:
+            my_loc["ping"] = 0
+            peer_locations.append(my_loc)
+
+        return peer_locations
+
 
     def actionSidebarGetPeers(self, to):
         permissions = self.getPermissions(to)
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
         try:
-            import maxminddb
-            db_path = config.data_dir + '/GeoLite2-City.mmdb'
-            if not os.path.isfile(db_path) or os.path.getsize(db_path) == 0:
-                if not self.downloadGeoLiteDb(db_path):
-                    return False
-            geodb = maxminddb.open_database(db_path)
-
-            peers = self.site.peers.values()
-            # Find avg ping
+            peer_locations = self.getPeerLocations(self.site.peers)
+            globe_data = []
             ping_times = [
-                peer.connection.last_ping_delay
-                for peer in peers
-                if peer.connection and peer.connection.last_ping_delay and peer.connection.last_ping_delay
+                peer_location["ping"]
+                for peer_location in peer_locations
+                if peer_location["ping"]
             ]
             if ping_times:
                 ping_avg = sum(ping_times) / float(len(ping_times))
             else:
                 ping_avg = 0
-            # Place bars
-            globe_data = []
-            placed = {}  # Already placed bars here
-            for peer in peers:
-                # Height of bar
-                if peer.connection and peer.connection.last_ping_delay:
-                    ping = min(0.20, math.log(1 + peer.connection.last_ping_delay / ping_avg, 300))
+
+            for peer_location in peer_locations:
+                if peer_location["ping"] == 0:  # Me
+                    height = -0.135
+                elif peer_location["ping"]:
+                    height = min(0.20, math.log(1 + peer_location["ping"] / ping_avg, 300))
                 else:
-                    ping = -0.03
+                    height = -0.03
 
-                # Query and cache location
-                if peer.ip in loc_cache:
-                    loc = loc_cache[peer.ip]
-                else:
-                    try:
-                        loc = geodb.get(peer.ip)
-                    except:
-                        loc = None
-                    loc_cache[peer.ip] = loc
-                if not loc or "location" not in loc:
-                    continue
-
-                # Create position array
-                lat, lon = (loc["location"]["latitude"], loc["location"]["longitude"])
-                latlon = "%s,%s" % (lat, lon)
-                if latlon in placed:  # Dont place more than 1 bar to same place, fake repos using ip address last two part
-                    lat += float(128 - int(peer.ip.split(".")[-2])) / 50
-                    lon += float(128 - int(peer.ip.split(".")[-1])) / 50
-                    latlon = "%s,%s" % (lat, lon)
-                placed[latlon] = True
-
-                globe_data += (lat, lon, ping)
-            # Append myself
-            loc = geodb.get(config.ip_external)
-            if loc and loc.get("location"):
-                lat, lon = (loc["location"]["latitude"], loc["location"]["longitude"])
-                globe_data += (lat, lon, -0.135)
+                globe_data += [peer_location["lat"], peer_location["lon"], height]
 
             self.response(to, globe_data)
         except Exception, err:
@@ -571,24 +630,17 @@ class UiWebsocketPlugin(object):
 
     def actionSiteSetOwned(self, to, owned):
         permissions = self.getPermissions(to)
-
-        if "Multiuser" in PluginManager.plugin_manager.plugin_names:
-            self.cmd("notification", ["info", "This function is disabled on this proxy"])
-            return False
-
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
+
         self.site.settings["own"] = bool(owned)
+        self.site.updateWebsocket(owned=owned)
 
     def actionSiteSetAutodownloadoptional(self, to, owned):
         permissions = self.getPermissions(to)
-
-        if "Multiuser" in PluginManager.plugin_manager.plugin_names:
-            self.cmd("notification", ["info", _["This function is disabled on this proxy"]])
-            return False
-
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
+
         self.site.settings["autodownloadoptional"] = bool(owned)
         self.site.bad_files = {}
         gevent.spawn(self.site.update, check_files=True)
@@ -598,10 +650,6 @@ class UiWebsocketPlugin(object):
         permissions = self.getPermissions(to)
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
-
-        if "Multiuser" in PluginManager.plugin_manager.plugin_names:
-            self.cmd("notification", ["info", _["This function is disabled on this proxy"]])
-            return False
 
         self.site.storage.closeDb()
         self.site.storage.getDb()

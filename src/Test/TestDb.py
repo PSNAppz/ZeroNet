@@ -1,8 +1,4 @@
-import os
 import cStringIO as StringIO
-
-from Config import config
-from Db import Db
 
 
 class TestDb:
@@ -53,13 +49,24 @@ class TestDb:
             {"test_id": [1, 2, 3], "title": ["Test #2", "Test #3", "Test #4"]}
         ).fetchone()["num"] == 2
 
+        # Test multiple select using named params
+        assert db.execute("SELECT COUNT(*) AS num FROM test WHERE test_id IN :test_id", {"test_id": [1, 2, 3]}).fetchone()["num"] == 3
+        assert db.execute(
+            "SELECT COUNT(*) AS num FROM test WHERE test_id IN :test_id AND title = :title",
+            {"test_id": [1, 2, 3], "title": "Test #2"}
+        ).fetchone()["num"] == 1
+        assert db.execute(
+            "SELECT COUNT(*) AS num FROM test WHERE test_id IN :test_id AND title IN :title",
+            {"test_id": [1, 2, 3], "title": ["Test #2", "Test #3", "Test #4"]}
+        ).fetchone()["num"] == 2
+
         # Test named parameter escaping
         assert db.execute(
             "SELECT COUNT(*) AS num FROM test WHERE test_id = :test_id AND title LIKE :titlelike",
             {"test_id": 1, "titlelike": "Test%"}
         ).fetchone()["num"] == 1
 
-    def testLoadJson(self, db):
+    def testUpdateJson(self, db):
         f = StringIO.StringIO()
         f.write("""
             {
@@ -69,6 +76,21 @@ class TestDb:
             }
         """)
         f.seek(0)
-        assert db.loadJson(db.db_dir + "data.json", f) == True
+        assert db.updateJson(db.db_dir + "data.json", f) is True
         assert db.execute("SELECT COUNT(*) AS num FROM test_importfilter").fetchone()["num"] == 1
         assert db.execute("SELECT COUNT(*) AS num FROM test").fetchone()["num"] == 1
+
+    def testUnsafePattern(self, db):
+        db.schema["maps"] = {"[A-Za-z.]*": db.schema["maps"]["data.json"]}  # Only repetition of . supported
+        f = StringIO.StringIO()
+        f.write("""
+            {
+                "test": [
+                    {"test_id": 1, "title": "Test 1 title", "extra col": "Ignore it"}
+                ]
+            }
+        """)
+        f.seek(0)
+        assert db.updateJson(db.db_dir + "data.json", f) is False
+        assert db.execute("SELECT COUNT(*) AS num FROM test_importfilter").fetchone()["num"] == 0
+        assert db.execute("SELECT COUNT(*) AS num FROM test").fetchone()["num"] == 0

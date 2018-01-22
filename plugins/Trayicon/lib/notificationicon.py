@@ -8,6 +8,11 @@ import os
 import uuid
 import time
 import gevent
+import threading
+try:
+    from queue import Empty as queue_Empty  # Python 3
+except ImportError:
+    from Queue import Empty as queue_Empty  # Python 2
 
 __all__ = ['NotificationIcon']
 
@@ -666,7 +671,7 @@ class NotificationIcon(object):
             while not self._pumpqueue.empty():
                 callable = self._pumpqueue.get(False)
                 callable()
-        except Queue.Empty:
+        except queue_Empty:
             pass
 
 
@@ -679,6 +684,9 @@ def hideConsole():
 
 def showConsole():
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 1)
+
+def hasConsole():
+    return ctypes.windll.kernel32.GetConsoleWindow() != 0
 
 if __name__ == "__main__":
     import time

@@ -42,7 +42,7 @@ class ActionsPlugin(object):
 
         ui_ip = config.ui_ip if config.ui_ip != "*" else "127.0.0.1"
 
-        icon.items = (
+        icon.items = [
             (self.titleIp, False),
             (self.titleConnections, False),
             (self.titleTransfer, False),
@@ -57,8 +57,11 @@ class ActionsPlugin(object):
             (_["!Open ZeroNet"], lambda: self.opensite("http://%s:%s/%s" % (ui_ip, config.ui_port, config.homepage))),
             "--",
             (_["Quit"], self.quit),
+        ]
 
-        )
+        if not notificationicon.hasConsole():
+            del icon.items[3]
+
         icon.clicked = lambda: self.opensite("http://%s:%s/%s" % (ui_ip, config.ui_port, config.homepage))
         self.quit_servers_event = gevent.threadpool.ThreadResult(
             lambda res: gevent.spawn_later(0.1, self.quitServers)
@@ -118,19 +121,33 @@ class ActionsPlugin(object):
 
     def formatAutorun(self):
         args = sys.argv[:]
-        args.insert(0, sys.executable)
+
+        if not getattr(sys, 'frozen', False):  # Not frozen
+            args.insert(0, sys.executable)
+            cwd = os.getcwd().decode(sys.getfilesystemencoding())
+        else:
+            cwd = os.path.dirname(sys.executable).decode(sys.getfilesystemencoding())
+
         if sys.platform == 'win32':
-            args = ['"%s"' % arg for arg in args]
+            args = ['"%s"' % arg for arg in args if arg]
         cmd = " ".join(args)
 
         # Dont open browser on autorun
         cmd = cmd.replace("start.py", "zeronet.py").replace('"--open_browser"', "").replace('"default_browser"', "").strip()
+        cmd += ' --open_browser ""'
+        cmd = cmd.decode(sys.getfilesystemencoding())
 
-        return "@echo off\ncd /D %s\n%s" % (os.getcwd(), cmd)
+        return u"""
+            @echo off
+            chcp 65001 > nul
+            set PYTHONIOENCODING=utf-8
+            cd /D \"%s\"
+            start "" %s
+        """ % (cwd, cmd)
 
     def isAutorunEnabled(self):
         path = self.getAutorunPath()
-        return os.path.isfile(path) and open(path).read() == self.formatAutorun()
+        return os.path.isfile(path) and open(path).read().decode("utf8") == self.formatAutorun()
 
     def titleAutorun(self):
         translate = _["Start ZeroNet when Windows starts"]
@@ -143,4 +160,4 @@ class ActionsPlugin(object):
         if self.isAutorunEnabled():
             os.unlink(self.getAutorunPath())
         else:
-            open(self.getAutorunPath(), "w").write(self.formatAutorun())
+            open(self.getAutorunPath(), "w").write(self.formatAutorun().encode("utf8"))

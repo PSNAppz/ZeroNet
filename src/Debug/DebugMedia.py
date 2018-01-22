@@ -18,7 +18,7 @@ def findfiles(path, find_ext):
         elif f2 == "":
             return -1
         else:
-            return cmp(f1, f2)
+            return cmp(f1.lower(), f2.lower())
 
     for root, dirs, files in sorted(os.walk(path, topdown=False), cmp=sorter):
         for file in sorted(files):
@@ -85,7 +85,7 @@ def merge(merged_path):
                     return False  # No coffeescript compiler, skip this file
 
                 # Replace / with os separators and escape it
-                file_path_escaped = helper.shellquote(os.path.join(*file_path.split("/")))
+                file_path_escaped = helper.shellquote(file_path.replace("/", os.path.sep))
 
                 if "%s" in config.coffeescript_compiler:  # Replace %s with coffeescript file
                     command = config.coffeescript_compiler % file_path_escaped

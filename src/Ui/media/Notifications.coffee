@@ -13,7 +13,7 @@ class Notifications
 
 
 	add: (id, type, body, timeout=0) ->
-		id = id.replace /[^A-Za-z0-9]/g, ""
+		id = id.replace /[^A-Za-z0-9-]/g, ""
 		# Close notifications with same id
 		for elem in $(".notification-#{id}")
 			@close $(elem)
@@ -57,6 +57,7 @@ class Notifications
 		elem.css({"width": "50px", "transform": "scale(0.01)"})
 		elem.animate({"scale": 1}, 800, "easeOutElastic")
 		elem.animate({"width": width}, 700, "easeInOutCubic")
+		$(".body", elem).css("width": (width - 80))
 		$(".body", elem).cssLater("box-shadow", "0px 0px 5px rgba(0,0,0,0.1)", 1000)
 
 		# Close button or Confirm button

@@ -35,9 +35,9 @@ class ContentDbDict(dict):
     def getItemSize(self, key):
         return self.site.storage.getSize(key)
 
-    # Only keep last 50 accessed json in memory
+    # Only keep last 10 accessed json in memory
     def checkLimit(self):
-        if len(self.cached_keys) > 50:
+        if len(self.cached_keys) > 10:
             key_deleted = self.cached_keys.pop(0)
             dict.__setitem__(self, key_deleted, False)
 
@@ -73,7 +73,7 @@ class ContentDbDict(dict):
         for key in dict.keys(self):
             try:
                 val = self[key]
-            except Exception, err:
+            except Exception as err:
                 self.log.warning("Error loading %s: %s" % (key, err))
                 continue
             yield key, val
@@ -83,7 +83,7 @@ class ContentDbDict(dict):
         for key in dict.keys(self):
             try:
                 val = self[key]
-            except Exception, err:
+            except Exception as err:
                 self.log.warning("Error loading %s: %s" % (key, err))
                 continue
             back.append((key, val))
@@ -104,6 +104,11 @@ class ContentDbDict(dict):
         try:
             return self.__getitem__(key)
         except KeyError:
+            return default
+        except Exception as err:
+            self.site.bad_files[key] = self.site.bad_files.get(key, 1)
+            dict.__delitem__(self, key)
+            self.log.warning("Error loading %s: %s" % (key, err))
             return default
 
     def execute(self, query, params={}):

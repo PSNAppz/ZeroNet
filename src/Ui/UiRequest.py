@@ -5,6 +5,8 @@ import mimetypes
 import json
 import cgi
 
+import gevent
+
 from Config import config
 from Site import SiteManager
 from User import UserManager
@@ -74,8 +76,16 @@ class UiRequest(object):
         if not self.isHostAllowed(self.env.get("HTTP_HOST")):
             return self.error403("Invalid host: %s" % self.env.get("HTTP_HOST"), details=False)
 
+        # Prepend .bit host for transparent proxy
+        if self.server.site_manager.isDomain(self.env.get("HTTP_HOST")):
+            path = re.sub("^/", "/" + self.env.get("HTTP_HOST") + "/", path)
         path = re.sub("^http://zero[/]+", "/", path)  # Remove begining http://zero/ for chrome extension
         path = re.sub("^http://", "/", path)  # Remove begining http for chrome extension .bit access
+
+        # Sanitize request url
+        path = path.replace("\\", "/")
+        if "../" in path or "./" in path:
+            return self.error403("Invalid path: %s" % path)
 
         if self.env["REQUEST_METHOD"] == "OPTIONS":
             if "/" not in path.strip("/"):
@@ -83,7 +93,7 @@ class UiRequest(object):
             else:
                 content_type = self.getContentType(path)
 
-            extra_headers = [("Access-Control-Allow-Origin", "null")]
+            extra_headers = {"Access-Control-Allow-Origin": "null"}
 
             self.sendHeader(content_type=content_type, extra_headers=extra_headers)
             return ""
@@ -95,7 +105,7 @@ class UiRequest(object):
         # Internal functions
         elif "/ZeroNet-Internal/" in path:
             path = re.sub(".*?/ZeroNet-Internal/", "/", path)
-            func = getattr(self, "action" + path.lstrip("/"), None)  # Check if we have action+request_path function
+            func = getattr(self, "action" + path.strip("/"), None)  # Check if we have action+request_path function
             if func:
                 return func()
             else:
@@ -123,23 +133,27 @@ class UiRequest(object):
             return self.actionSiteAdd()
         # Site media wrapper
         else:
-            if self.get.get("wrapper_nonce") and self.get["wrapper_nonce"] in self.server.wrapper_nonces:
-                self.server.wrapper_nonces.remove(self.get["wrapper_nonce"])
-                return self.actionSiteMedia("/media" + path)  # Only serve html files with frame
+            if self.get.get("wrapper_nonce"):
+                if self.get["wrapper_nonce"] in self.server.wrapper_nonces:
+                    self.server.wrapper_nonces.remove(self.get["wrapper_nonce"])
+                    return self.actionSiteMedia("/media" + path)  # Only serve html files with frame
+                else:
+                    self.server.log.warning("Invalid wrapper nonce: %s" % self.get["wrapper_nonce"])
+                    body = self.actionWrapper(path)
             else:
                 body = self.actionWrapper(path)
             if body:
                 return body
             else:
-                func = getattr(self, "action" + path.lstrip("/"), None)  # Check if we have action+request_path function
+                func = getattr(self, "action" + path.strip("/"), None)  # Check if we have action+request_path function
                 if func:
                     return func()
                 else:
                     return self.error404(path)
 
-    # The request is proxied by chrome extension
+    # The request is proxied by chrome extension or a transparent proxy
     def isProxyRequest(self):
-        return self.env["PATH_INFO"].startswith("http://")
+        return self.env["PATH_INFO"].startswith("http://") or (self.server.allow_trans_proxy and self.server.site_manager.isDomain(self.env.get("HTTP_HOST")))
 
     def isWebSocketRequest(self):
         return self.env.get("HTTP_UPGRADE") == "websocket"
@@ -204,22 +218,25 @@ class UiRequest(object):
             return referer
 
     # Send response headers
-    def sendHeader(self, status=200, content_type="text/html", noscript=False, extra_headers=[]):
-        headers = []
-        headers.append(("Version", "HTTP/1.1"))
-        headers.append(("Connection", "Keep-Alive"))
-        headers.append(("Keep-Alive", "max=25, timeout=30"))
-        headers.append(("X-Frame-Options", "SAMEORIGIN"))
+    def sendHeader(self, status=200, content_type="text/html", noscript=False, allow_ajax=False, extra_headers=[]):
+        headers = {}
+        headers["Version"] = "HTTP/1.1"
+        headers["Connection"] = "Keep-Alive"
+        headers["Keep-Alive"] = "max=25, timeout=30"
+        headers["X-Frame-Options"] = "SAMEORIGIN"
         if content_type != "text/html" and self.env.get("HTTP_REFERER") and self.isSameOrigin(self.getReferer(), self.getRequestUrl()):
-            headers.append(("Access-Control-Allow-Origin", "*"))  # Allow load font files from css
+            headers["Access-Control-Allow-Origin"] = "*"  # Allow load font files from css
 
         if noscript:
-            headers.append(("Content-Security-Policy", "default-src 'none'; sandbox allow-top-navigation allow-forms; img-src 'self'; font-src 'self'; media-src 'self'; style-src 'self' 'unsafe-inline';"))
+            headers["Content-Security-Policy"] = "default-src 'none'; sandbox allow-top-navigation allow-forms; img-src 'self'; font-src 'self'; media-src 'self'; style-src 'self' 'unsafe-inline';"
+
+        if allow_ajax:
+            headers["Access-Control-Allow-Origin"] = "null"
 
         if self.env["REQUEST_METHOD"] == "OPTIONS":
             # Allow json access
-            headers.append(("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Cookie, Range"))
-            headers.append(("Access-Control-Allow-Credentials", "true"))
+            headers["Access-Control-Allow-Headers"] = "Origin, X-Requested-With, Content-Type, Accept, Cookie, Range"
+            headers["Access-Control-Allow-Credentials"] = "true"
 
         if content_type == "text/html":
             content_type = "text/html; charset=utf-8"
@@ -228,7 +245,7 @@ class UiRequest(object):
 
         # Download instead of display file types that can be dangerous
         if re.findall("/svg|/xml|/x-shockwave-flash|/pdf", content_type):
-            headers.append(("Content-Disposition", "attachment"))
+            headers["Content-Disposition"] = "attachment"
 
         cacheable_type = (
             content_type == "text/css" or content_type.startswith("image") or content_type.startswith("video") or
@@ -236,18 +253,19 @@ class UiRequest(object):
         )
 
         if status in (200, 206) and cacheable_type:  # Cache Css, Js, Image files for 10min
-            headers.append(("Cache-Control", "public, max-age=600"))  # Cache 10 min
+            headers["Cache-Control"] = "public, max-age=600"  # Cache 10 min
         else:
-            headers.append(("Cache-Control", "no-cache, no-store, private, must-revalidate, max-age=0"))  # No caching at all
-        headers.append(("Content-Type", content_type))
-        for extra_header in extra_headers:
-            headers.append(extra_header)
-        return self.start_response(status_texts[status], headers)
+            headers["Cache-Control"] = "no-cache, no-store, private, must-revalidate, max-age=0"  # No caching at all
+        headers["Content-Type"] = content_type
+        headers.update(extra_headers)
+        return self.start_response(status_texts[status], headers.items())
 
     # Renders a template
     def render(self, template_path, *args, **kwargs):
-        template = open(template_path).read().decode("utf8")
-        return template.format(**kwargs).encode("utf8")
+        template = open(template_path).read()
+        for key, val in kwargs.items():
+            template = template.replace("{%s}" % key, "%s" % val)
+        return template.encode("utf8")
 
     # - Actions -
 
@@ -262,9 +280,10 @@ class UiRequest(object):
     # Render a file from media with iframe site wrapper
     def actionWrapper(self, path, extra_headers=None):
         if not extra_headers:
-            extra_headers = []
+            extra_headers = {}
 
         match = re.match("/(?P<address>[A-Za-z0-9\._-]+)(?P<inner_path>/.*|$)", path)
+        just_added = False
         if match:
             address = match.group("address")
             inner_path = match.group("inner_path").lstrip("/")
@@ -290,12 +309,25 @@ class UiRequest(object):
                 title = site.content_manager.contents["content.json"]["title"]
             else:
                 title = "Loading %s..." % address
-                site = SiteManager.site_manager.need(address)  # Start download site
+                site = SiteManager.site_manager.get(address)
+                if site:  # Already added, but not downloaded
+                    if time.time() - site.announcer.time_last_announce > 5:
+                        site.log.debug("Reannouncing site...")
+                        gevent.spawn(site.update, announce=True)
+                else:  # If not added yet
+                    site = SiteManager.site_manager.need(address)
+                    just_added = True
 
                 if not site:
                     return False
 
-            self.sendHeader(extra_headers=extra_headers[:])
+            self.sendHeader(extra_headers=extra_headers)
+
+            min_last_announce = (time.time() - site.announcer.time_last_announce) / 60
+            if min_last_announce > 60 and site.settings["serving"] and not just_added:
+                site.log.debug("Site requested, but not announced recently (last %.0fmin ago). Updating..." % min_last_announce)
+                gevent.spawn(site.update, announce=True)
+
             return iter([self.renderWrapper(site, path, inner_path, title, extra_headers)])
             # Make response be sent at once (see https://github.com/HelloZeroNet/ZeroNet/issues/1092)
 
@@ -307,6 +339,21 @@ class UiRequest(object):
             return "http://zero/" + address
         else:
             return "/" + address
+
+    def processQueryString(self, site, query_string):
+        match = re.search("zeronet_peers=(.*?)(&|$)", query_string)
+        if match:
+            query_string = query_string.replace(match.group(0), "")
+            num_added = 0
+            for peer in match.group(1).split(","):
+                if not re.match(".*?:[0-9]+$", peer):
+                    continue
+                ip, port = peer.split(":")
+                if site.addPeer(ip, int(port), source="query_string"):
+                    num_added += 1
+            site.log.debug("%s peers added by query string" % num_added)
+
+        return query_string
 
     def renderWrapper(self, site, path, inner_path, title, extra_headers, show_loadingscreen=None):
         file_inner_path = inner_path
@@ -336,13 +383,15 @@ class UiRequest(object):
         postmessage_nonce_security = "false"
 
         wrapper_nonce = self.getWrapperNonce()
+        inner_query_string = self.processQueryString(site, self.env.get("QUERY_STRING", ""))
 
-        if self.env.get("QUERY_STRING"):
-            query_string = "?%s&wrapper_nonce=%s" % (self.env["QUERY_STRING"], wrapper_nonce)
+        if inner_query_string:
+            inner_query_string = "?%s&wrapper_nonce=%s" % (inner_query_string, wrapper_nonce)
         elif "?" in inner_path:
-            query_string = "&wrapper_nonce=%s" % wrapper_nonce
+            inner_query_string = "&wrapper_nonce=%s" % wrapper_nonce
         else:
-            query_string = "?wrapper_nonce=%s" % wrapper_nonce
+            inner_query_string = "?wrapper_nonce=%s" % wrapper_nonce
+
 
         if self.isProxyRequest():  # Its a remote proxy request
             if self.env["REMOTE_ADDR"] == "127.0.0.1":  # Local client, the server address also should be 127.0.0.1
@@ -368,6 +417,10 @@ class UiRequest(object):
 
         sandbox_permissions = ""
 
+        if "NOSANDBOX" in site.settings["permissions"]:
+            sandbox_permissions += " allow-same-origin"
+
+
         if show_loadingscreen is None:
             show_loadingscreen = not site.storage.isFile(file_inner_path)
 
@@ -381,7 +434,7 @@ class UiRequest(object):
             title=cgi.escape(title, True),
             body_style=body_style,
             meta_tags=meta_tags,
-            query_string=re.escape(query_string),
+            query_string=re.escape(inner_query_string),
             wrapper_key=site.settings["wrapper_key"],
             ajax_key=site.settings["ajax_key"],
             wrapper_nonce=wrapper_nonce,
@@ -415,6 +468,7 @@ class UiRequest(object):
 
     # Return {address: 1Site.., inner_path: /data/users.json} from url path
     def parsePath(self, path):
+        path = path.replace("\\", "/")
         path = path.replace("/index.html/", "/")  # Base Backward compatibility fix
         if path.endswith("/"):
             path = path + "index.html"
@@ -427,6 +481,8 @@ class UiRequest(object):
             path_parts = match.groupdict()
             path_parts["request_address"] = path_parts["address"]  # Original request address (for Merger sites)
             path_parts["inner_path"] = path_parts["inner_path"].lstrip("/")
+            if not path_parts["inner_path"]:
+                path_parts["inner_path"] = "index.html"
             return path_parts
         else:
             return None
@@ -446,6 +502,7 @@ class UiRequest(object):
 
         address = path_parts["address"]
         file_path = "%s/%s/%s" % (config.data_dir, address, path_parts["inner_path"])
+
         if config.debug and file_path.split("/")[-1].startswith("all."):
             # If debugging merge *.css to all.css and *.js to all.js
             site = self.server.sites.get(address)
@@ -490,9 +547,6 @@ class UiRequest(object):
                 return self.actionFile(file_path, header_length=header_length, header_noscript=header_noscript, header_allow_ajax=header_allow_ajax, file_size=file_size, path_parts=path_parts)
             else:
                 self.log.debug("File not found: %s" % path_parts["inner_path"])
-                # Site larger than allowed, re-add wrapper nonce to allow reload
-                if site.settings.get("size", 0) > site.getSizeLimit() * 1024 * 1024:
-                    self.server.wrapper_nonces.append(self.get.get("wrapper_nonce"))
                 return self.error404(path_parts["inner_path"])
 
     # Serve a media for ui
@@ -561,9 +615,7 @@ class UiRequest(object):
                     status = 206
                 else:
                     status = 200
-                if header_allow_ajax:
-                    extra_headers["Access-Control-Allow-Origin"] = "null"
-                self.sendHeader(status, content_type=content_type, noscript=header_noscript, extra_headers=extra_headers.items())
+                self.sendHeader(status, content_type=content_type, noscript=header_noscript, allow_ajax=header_allow_ajax, extra_headers=extra_headers)
             if self.env["REQUEST_METHOD"] != "OPTIONS":
                 if not file_obj:
                     file_obj = open(file_path, "rb")
@@ -669,7 +721,7 @@ class UiRequest(object):
     # You are not allowed to access this
     def error403(self, message="", details=True):
         self.sendHeader(403)
-        self.log.debug("Error 403: %s" % message)
+        self.log.error("Error 403: %s" % message)
         return self.formatError("Forbidden", message, details=details)
 
     # Send file not found error

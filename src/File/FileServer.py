@@ -2,10 +2,11 @@ import logging
 import urllib2
 import re
 import time
-import socket
 import random
+import socket
 
 import gevent
+import gevent.pool
 
 import util
 from Config import config
@@ -14,12 +15,31 @@ from Site import SiteManager
 from Debug import Debug
 from Connection import ConnectionServer
 from util import UpnpPunch
+from Plugin import PluginManager
 
 
+@PluginManager.acceptPlugins
 class FileServer(ConnectionServer):
 
     def __init__(self, ip=config.fileserver_ip, port=config.fileserver_port):
+        self.site_manager = SiteManager.site_manager
+        self.log = logging.getLogger("FileServer")
+        ip = ip.replace("*", "0.0.0.0")
+
+        if config.tor == "always":
+            port = config.tor_hs_port
+            config.fileserver_port = port
+        elif port == 0:  # Use random port
+            port_range_from, port_range_to = map(int, config.fileserver_port_range.split("-"))
+            port = self.getRandomPort(ip, port_range_from, port_range_to)
+            config.fileserver_port = port
+            if not port:
+                raise Exception("Can't find bindable port")
+            if not config.tor == "always":
+                config.saveValue("fileserver_port", port)  # Save random port value for next restart
+
         ConnectionServer.__init__(self, ip, port, self.handleRequest)
+
         if config.ip_external:  # Ip external defined in arguments
             self.port_opened = True
             SiteManager.peer_blacklist.append((config.ip_external, self.port))  # Add myself to peer blacklist
@@ -30,6 +50,28 @@ class FileServer(ConnectionServer):
         self.last_request = time.time()
         self.files_parsing = {}
         self.ui_server = None
+
+    def getRandomPort(self, ip, port_range_from, port_range_to):
+        self.log.info("Getting random port in range %s-%s..." % (port_range_from, port_range_to))
+        tried = []
+        for bind_retry in range(100):
+            port = random.randint(port_range_from, port_range_to)
+            if port in tried:
+                continue
+            tried.append(port)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind((ip, port))
+                success = True
+            except Exception as err:
+                self.log.warning("Error binding to port %s: %s" % (port, err))
+                success = False
+            sock.close()
+            if success:
+                return port
+            else:
+                time.sleep(0.1)
+        return False
 
     # Handle request to fileserver
     def handleRequest(self, connection, message):
@@ -43,7 +85,7 @@ class FileServer(ConnectionServer):
                 self.log.debug("FileRequest: %s %s" % (str(connection), message["cmd"]))
         req = FileRequest(self, connection)
         req.route(message["cmd"], message.get("req_id"), message.get("params"))
-        if not self.has_internet:
+        if not self.has_internet and not connection.is_private_ip:
             self.has_internet = True
             self.onInternetOnline()
 
@@ -75,7 +117,7 @@ class FileServer(ConnectionServer):
         try:
             UpnpPunch.ask_to_open_port(self.port, 'ZeroNet', retries=3, protos=["TCP"])
         except Exception as err:
-            self.log.error("UpnpPunch run error: %s" % Debug.formatException(err))
+            self.log.warning("UpnpPunch run error: %s" % Debug.formatException(err))
             return False
 
         if self.testOpenport(port)["result"] is True:
@@ -100,7 +142,7 @@ class FileServer(ConnectionServer):
 
     def testOpenportP2P(self, port=None):
         self.log.info("Checking port %s using P2P..." % port)
-        site = SiteManager.site_manager.get(config.homepage)
+        site = self.site_manager.get(config.homepage)
         peers = []
         res = None
         if not site:    # First run, has no any peers
@@ -108,7 +150,7 @@ class FileServer(ConnectionServer):
         peers = [peer for peer in site.getRecentPeers(10) if not peer.ip.endswith(".onion")]
         if len(peers) < 3:   # Not enough peers
             return self.testOpenportPortchecker(port)  # Fallback to centralized service
-        for retry in range(0, 3): # Try 3 peers
+        for retry in range(0, 3):  # Try 3 peers
             random_peer = random.choice(peers)
             with gevent.Timeout(10.0, False):  # 10 sec timeout, don't raise exception
                 if not random_peer.connection:
@@ -215,13 +257,12 @@ class FileServer(ConnectionServer):
             site.update(check_files=check_files)  # Update site's content.json and download changed files
             site.sendMyHashfield()
             site.updateHashfield()
-            if len(site.peers) > 5:  # Keep active connections if site having 5 or more peers
-                site.needConnections()
 
     # Check sites integrity
     @util.Noparallel()
     def checkSites(self, check_files=False, force_port_check=False):
         self.log.debug("Checking sites...")
+        s = time.time()
         sites_checking = False
         if self.port_opened is None or force_port_check:  # Test and open port if not tested yet
             if len(self.sites) <= 2:  # Don't wait port opening on first startup
@@ -236,11 +277,13 @@ class FileServer(ConnectionServer):
                 self.tor_manager.startOnions()
 
         if not sites_checking:
+            check_pool = gevent.pool.Pool(5)
             for site in sorted(self.sites.values(), key=lambda site: site.settings.get("modified", 0), reverse=True):  # Check sites integrity
-                check_thread = gevent.spawn(self.checkSite, site, check_files)  # Check in new thread
+                check_thread = check_pool.spawn(self.checkSite, site, check_files)  # Check in new thread
                 time.sleep(2)
                 if site.settings.get("modified", 0) < time.time() - 60 * 60 * 24:  # Not so active site, wait some sec to finish
                     check_thread.join(timeout=5)
+        self.log.debug("Checksites done in %.3fs" % (time.time() - s))
 
     def cleanupSites(self):
         import gc
@@ -267,14 +310,16 @@ class FileServer(ConnectionServer):
 
                 if site.peers:
                     with gevent.Timeout(10, exception=False):
-                        site.announcePex()
+                        site.announcer.announcePex()
 
                 # Retry failed files
                 if site.bad_files:
                     site.retryBadFiles()
 
-                if not startup:  # Don't do it at start up because checkSite already has needConnections at start up.
-                    connected_num = site.needConnections(check_site_on_reconnect=True)  # Keep active peer connection to get the updates
+                if time.time() - site.settings.get("modified", 0) < 60 * 60 * 24 * 7:
+                    # Keep active connections if site has been modified witin 7 days
+                    connected_num = site.needConnections(check_site_on_reconnect=True)
+
                     if connected_num < config.connected_limit:  # This site has small amount of peers, protect them from closing
                         peers_protected.update([peer.key for peer in site.getConnectedPeers()])
 
@@ -285,18 +330,11 @@ class FileServer(ConnectionServer):
             startup = False
             time.sleep(60 * 20)
 
-    def trackersFileReloader(self):
-        while 1:
-            config.loadTrackersFile()
-            time.sleep(60)
-
     # Announce sites every 20 min
     def announceSites(self):
-        if config.trackers_file:
-            gevent.spawn(self.trackersFileReloader)
-
         time.sleep(5 * 60)  # Sites already announced on startup
         while 1:
+            config.loadTrackersFile()
             s = time.time()
             for address, site in self.sites.items():
                 if not site.settings["serving"]:
@@ -311,7 +349,7 @@ class FileServer(ConnectionServer):
             taken = time.time() - s
 
             sleep = max(0, 60 * 20 / len(config.trackers) - taken)  # Query all trackers one-by-one in 20 minutes evenly distributed
-            self.log.debug("Site announce tracker done in %.3fs, sleeping for %ss..." % (taken, sleep))
+            self.log.debug("Site announce tracker done in %.3fs, sleeping for %.3fs..." % (taken, sleep))
             time.sleep(sleep)
 
     # Detects if computer back from wakeup
@@ -330,13 +368,13 @@ class FileServer(ConnectionServer):
 
     # Bind and start serving sites
     def start(self, check_sites=True):
-        self.sites = SiteManager.site_manager.list()
-        self.log = logging.getLogger("FileServer")
-
+        ConnectionServer.start(self)
+        self.sites = self.site_manager.list()
         if config.debug:
             # Auto reload FileRequest on change
             from Debug import DebugReloader
             DebugReloader(self.reload)
+
 
         if check_sites:  # Open port, Update sites, Check files integrity
             gevent.spawn(self.checkSites)
@@ -345,7 +383,7 @@ class FileServer(ConnectionServer):
         thread_cleanup_sites = gevent.spawn(self.cleanupSites)
         thread_wakeup_watcher = gevent.spawn(self.wakeupWatcher)
 
-        ConnectionServer.start(self)
+        ConnectionServer.listen(self)
 
         self.log.debug("Stopped.")
 
@@ -357,4 +395,5 @@ class FileServer(ConnectionServer):
                 self.log.info('Closed port via upnp.')
             except (UpnpPunch.UpnpError, UpnpPunch.IGDError), err:
                 self.log.info("Failed at attempt to use upnp to close port: %s" % err)
-        ConnectionServer.stop(self)
+
+        return ConnectionServer.stop(self)

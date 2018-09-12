@@ -13,17 +13,18 @@ from Config import config
 from Debug import Debug
 from util import StreamingMsgpack
 from Crypt import CryptConnection
+from util import helper
 
 
 class Connection(object):
     __slots__ = (
         "sock", "sock_wrapped", "ip", "port", "cert_pin", "target_onion", "id", "protocol", "type", "server", "unpacker", "req_id",
-        "handshake", "crypt", "connected", "event_connected", "closed", "start_time", "last_recv_time",
+        "handshake", "crypt", "connected", "event_connected", "closed", "start_time", "handshake_time", "last_recv_time", "is_private_ip", "is_tracker_connection",
         "last_message_time", "last_send_time", "last_sent_time", "incomplete_buff_recv", "bytes_recv", "bytes_sent", "cpu_time", "send_lock",
         "last_ping_delay", "last_req_time", "last_cmd_sent", "last_cmd_recv", "bad_actions", "sites", "name", "updateName", "waiting_requests", "waiting_streams"
     )
 
-    def __init__(self, server, ip, port, sock=None, target_onion=None):
+    def __init__(self, server, ip, port, sock=None, target_onion=None, is_tracker_connection=False):
         self.sock = sock
         self.ip = ip
         self.port = port
@@ -35,6 +36,12 @@ class Connection(object):
         server.last_connection_id += 1
         self.protocol = "?"
         self.type = "?"
+
+        if helper.isPrivateIp(self.ip) and self.ip not in config.ip_local:
+            self.is_private_ip = True
+        else:
+            self.is_private_ip = False
+        self.is_tracker_connection = is_tracker_connection
 
         self.server = server
         self.unpacker = None  # Stream incoming socket messages here
@@ -49,6 +56,7 @@ class Connection(object):
 
         # Stats
         self.start_time = time.time()
+        self.handshake_time = 0
         self.last_recv_time = 0
         self.last_message_time = 0
         self.last_send_time = 0
@@ -81,7 +89,7 @@ class Connection(object):
         return "<%s>" % self.__str__()
 
     def log(self, text):
-        self.server.log.debug("%s > %s" % (self.name, text))
+        self.server.log.debug("%s > %s" % (self.name, text.decode("utf8", "ignore")))
 
     def getValidSites(self):
         return [key for key, val in self.server.tor_manager.site_onions.items() if val == self.target_onion]
@@ -104,6 +112,16 @@ class Connection(object):
             if not self.server.tor_manager or not self.server.tor_manager.enabled:
                 raise Exception("Can't connect to onion addresses, no Tor controller present")
             self.sock = self.server.tor_manager.createSocket(self.ip, self.port)
+        elif config.tor == "always" and helper.isPrivateIp(self.ip) and self.ip not in config.ip_local:
+            raise Exception("Can't connect to local IPs in Tor: always mode")
+        elif config.trackers_proxy != "disable" and self.is_tracker_connection:
+            if config.trackers_proxy == "tor":
+                self.sock = self.server.tor_manager.createSocket(self.ip, self.port)
+            else:
+                from lib.PySocks import socks
+                self.sock = socks.socksocket()
+                proxy_ip, proxy_port = config.trackers_proxy.split(":")
+                self.sock.set_proxy(socks.PROXY_TYPE_SOCKS5, proxy_ip, int(proxy_port))
         else:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -113,11 +131,25 @@ class Connection(object):
         self.sock.connect((self.ip, int(self.port)))
 
         # Implicit SSL
+        should_encrypt = not self.ip.endswith(".onion") and self.ip not in self.server.broken_ssl_ips and self.ip not in config.ip_local
         if self.cert_pin:
             self.sock = CryptConnection.manager.wrapSocket(self.sock, "tls-rsa", cert_pin=self.cert_pin)
             self.sock.do_handshake()
             self.crypt = "tls-rsa"
             self.sock_wrapped = True
+        elif should_encrypt and "tls-rsa" in CryptConnection.manager.crypt_supported:
+            try:
+                self.sock = CryptConnection.manager.wrapSocket(self.sock, "tls-rsa")
+                self.sock.do_handshake()
+                self.crypt = "tls-rsa"
+                self.sock_wrapped = True
+            except Exception, err:
+                if not config.force_encryption:
+                    self.log("Crypt connection error: %s, adding ip %s as broken ssl." % (err, self.ip))
+                    self.server.broken_ssl_ips[self.ip] = True
+                self.sock.close()
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.connect((self.ip, int(self.port)))
 
         # Detect protocol
         self.send({"cmd": "handshake", "req_id": 0, "params": self.getHandshakeInfo()})
@@ -154,8 +186,8 @@ class Connection(object):
         self.connected = True
         buff_len = 0
         req_len = 0
+        unpacker_bytes = 0
 
-        self.unpacker = msgpack.fallback.Unpacker()  # Due memory problems of C version
         try:
             while not self.closed:
                 buff = self.sock.recv(64 * 1024)
@@ -172,62 +204,88 @@ class Connection(object):
 
                 if not self.unpacker:
                     self.unpacker = msgpack.fallback.Unpacker()
-                self.unpacker.feed(buff)
-                buff = None
-                for message in self.unpacker:
-                    try:
-                        # Stats
-                        self.incomplete_buff_recv = 0
-                        stat_key = message.get("cmd", "unknown")
-                        if stat_key == "response" and "to" in message:
-                            cmd_sent = self.waiting_requests.get(message["to"], {"cmd": "unknown"})["cmd"]
-                            stat_key = "response: %s" % cmd_sent
-                        self.server.stat_recv[stat_key]["bytes"] += req_len
-                        self.server.stat_recv[stat_key]["num"] += 1
-                        if "stream_bytes" in message:
-                            self.server.stat_recv[stat_key]["bytes"] += message["stream_bytes"]
-                        req_len = 0
+                    unpacker_bytes = 0
 
-                        # Handle message
-                        if "stream_bytes" in message:
-                            self.handleStream(message)
-                        else:
-                            self.handleMessage(message)
-                    except TypeError:
+                self.unpacker.feed(buff)
+                unpacker_bytes += buff_len
+
+                while True:
+                    try:
+                        message = self.unpacker.next()
+                    except StopIteration:
+                        break
+                    if not type(message) is dict:
+                        if config.debug_socket:
+                            self.log("Invalid message type: %s, content: %r, buffer: %r" % (type(message), message, buff[0:16]))
                         raise Exception("Invalid message type: %s" % type(message))
 
+                    # Stats
+                    self.incomplete_buff_recv = 0
+                    stat_key = message.get("cmd", "unknown")
+                    if stat_key == "response" and "to" in message:
+                        cmd_sent = self.waiting_requests.get(message["to"], {"cmd": "unknown"})["cmd"]
+                        stat_key = "response: %s" % cmd_sent
+                    if stat_key == "update":
+                        stat_key = "update: %s" % message["params"]["site"]
+                    self.server.stat_recv[stat_key]["bytes"] += req_len
+                    self.server.stat_recv[stat_key]["num"] += 1
+                    if "stream_bytes" in message:
+                        self.server.stat_recv[stat_key]["bytes"] += message["stream_bytes"]
+                    req_len = 0
+
+                    # Handle message
+                    if "stream_bytes" in message:
+                        buff_left = self.handleStream(message, self.unpacker, buff, unpacker_bytes)
+                        self.unpacker = msgpack.fallback.Unpacker()
+                        self.unpacker.feed(buff_left)
+                        unpacker_bytes = len(buff_left)
+                        if config.debug_socket:
+                            self.log("Start new unpacker with buff_left: %r" % buff_left)
+                    else:
+                        self.handleMessage(message)
+
                 message = None
-        except Exception, err:
+        except Exception as err:
             if not self.closed:
                 self.log("Socket error: %s" % Debug.formatException(err))
-        self.close("MessageLoop ended")  # MessageLoop ended, close connection
+                self.server.stat_recv["error: %s" % err]["bytes"] += req_len
+                self.server.stat_recv["error: %s" % err]["num"] += 1
+        self.close("MessageLoop ended (closed: %s)" % self.closed)  # MessageLoop ended, close connection
 
     # Stream socket directly to a file
-    def handleStream(self, message):
-
-        read_bytes = message["stream_bytes"]  # Bytes left we have to read from socket
-        try:
-            buff = self.unpacker.read_bytes(min(16 * 1024, read_bytes))  # Check if the unpacker has something left in buffer
-        except Exception, err:
-            buff = ""
+    def handleStream(self, message, unpacker, buff, unpacker_bytes):
+        stream_bytes_left = message["stream_bytes"]
         file = self.waiting_streams[message["to"]]
-        if buff:
-            read_bytes -= len(buff)
-            file.write(buff)
+
+        if "tell" in dir(unpacker):
+            unpacker_unprocessed_bytes = unpacker_bytes - unpacker.tell()
+        else:
+            unpacker_unprocessed_bytes = unpacker._fb_buf_n - unpacker._fb_buf_o
+
+        if unpacker_unprocessed_bytes:  # Found stream bytes in unpacker
+            unpacker_stream_bytes = min(unpacker_unprocessed_bytes, stream_bytes_left)
+            buff_stream_start = len(buff) - unpacker_unprocessed_bytes
+            file.write(buff[buff_stream_start:buff_stream_start + unpacker_stream_bytes])
+            stream_bytes_left -= unpacker_stream_bytes
+        else:
+            unpacker_stream_bytes = 0
 
         if config.debug_socket:
-            self.log("Starting stream %s: %s bytes (%s from unpacker)" % (message["to"], message["stream_bytes"], len(buff)))
+            self.log(
+                "Starting stream %s: %s bytes (%s from unpacker, buff size: %s, unprocessed: %s)" %
+                (message["to"], message["stream_bytes"], unpacker_stream_bytes, len(buff), unpacker_unprocessed_bytes)
+            )
 
         try:
             while 1:
-                if read_bytes <= 0:
+                if stream_bytes_left <= 0:
                     break
-                buff = self.sock.recv(64 * 1024)
-                if not buff:
+                stream_buff = self.sock.recv(min(64 * 1024, stream_bytes_left))
+                if not stream_buff:
                     break
-                buff_len = len(buff)
-                read_bytes -= buff_len
-                file.write(buff)
+                buff_len = len(stream_buff)
+                stream_bytes_left -= buff_len
+                file.write(stream_buff)
 
                 # Statistics
                 self.last_recv_time = time.time()
@@ -238,12 +296,17 @@ class Connection(object):
             self.log("Stream read error: %s" % Debug.formatException(err))
 
         if config.debug_socket:
-            self.log("End stream %s" % message["to"])
+            self.log("End stream %s, file pos: %s" % (message["to"], file.tell()))
 
         self.incomplete_buff_recv = 0
         self.waiting_requests[message["to"]]["evt"].set(message)  # Set the response to event
         del self.waiting_streams[message["to"]]
         del self.waiting_requests[message["to"]]
+
+        if unpacker_stream_bytes:
+            return buff[buff_stream_start + unpacker_stream_bytes:]
+        else:
+            return ""
 
     # My handshake info
     def getHandshakeInfo(self):
@@ -272,29 +335,40 @@ class Connection(object):
             "target_ip": self.ip,
             "rev": config.rev,
             "crypt_supported": crypt_supported,
-            "crypt": self.crypt
+            "crypt": self.crypt,
+            "time": int(time.time() + self.server.timecorrection)
         }
         if self.target_onion:
             handshake["onion"] = self.target_onion
         elif self.ip.endswith(".onion"):
             handshake["onion"] = self.server.tor_manager.getOnion("global")
 
+        if self.is_tracker_connection:
+            handshake["tracker_connection"] = True
+
+        if config.debug_socket:
+            self.log("My Handshake: %s" % handshake)
+
         return handshake
 
     def setHandshake(self, handshake):
+        if config.debug_socket:
+            self.log("Remote Handshake: %s" % handshake)
+
+        if handshake.get("peer_id") == self.server.peer_id and not handshake.get("tracker_connection") and not self.is_tracker_connection:
+            self.close("Same peer id, can't connect to myself")
+            self.server.peer_blacklist.append((handshake["target_ip"], handshake["fileserver_port"]))
+            return False
+
         self.handshake = handshake
-        if handshake.get("port_opened", None) is False and "onion" not in handshake:  # Not connectable
+        if handshake.get("port_opened", None) is False and "onion" not in handshake and not self.is_private_ip:  # Not connectable
             self.port = 0
         else:
             self.port = handshake["fileserver_port"]  # Set peer fileserver port
 
-        if handshake.get("onion") and not self.ip.endswith(".onion"):  # Set incoming connection's onion address
-            self.ip = handshake["onion"] + ".onion"
-            self.updateName()
-
         # Check if we can encrypt the connection
-        if handshake.get("crypt_supported") and handshake["peer_id"] not in self.server.broken_ssl_peer_ids:
-            if self.ip.endswith(".onion"):
+        if handshake.get("crypt_supported") and self.ip not in self.server.broken_ssl_ips:
+            if self.ip.endswith(".onion") or self.ip in config.ip_local:
                 crypt = None
             elif handshake.get("crypt"):  # Recommended crypt by server
                 crypt = handshake["crypt"]
@@ -303,8 +377,18 @@ class Connection(object):
 
             if crypt:
                 self.crypt = crypt
+
+        if self.type == "in" and handshake.get("onion") and not self.ip.endswith(".onion"):  # Set incoming connection's onion address
+            if self.server.ips.get(self.ip) == self:
+                del self.server.ips[self.ip]
+            self.ip = handshake["onion"] + ".onion"
+            self.log("Changing ip to %s" % self.ip)
+            self.server.ips[self.ip] = self
+            self.updateName()
+
         self.event_connected.set(True)  # Mark handshake as done
         self.event_connected = None
+        self.handshake_time = time.time()
 
     # Handle incoming message
     def handleMessage(self, message):
@@ -358,8 +442,6 @@ class Connection(object):
 
     # Incoming handshake set request
     def handleHandshake(self, message):
-        if config.debug_socket:
-            self.log("Handshake request: %s" % message)
         self.setHandshake(message["params"])
         data = self.getHandshakeInfo()
         data["cmd"] = "response"
@@ -373,8 +455,9 @@ class Connection(object):
                 self.sock = CryptConnection.manager.wrapSocket(self.sock, self.crypt, server, cert_pin=self.cert_pin)
                 self.sock_wrapped = True
             except Exception, err:
-                self.log("Crypt connection error: %s, adding peerid %s as broken ssl." % (err, message["params"]["peer_id"]))
-                self.server.broken_ssl_peer_ids[message["params"]["peer_id"]] = True
+                if not config.force_encryption:
+                    self.log("Crypt connection error: %s, adding ip %s as broken ssl." % (err, self.ip))
+                    self.server.broken_ssl_ips[self.ip] = True
                 self.close("Broken ssl")
 
         if not self.sock_wrapped and self.cert_pin:
@@ -393,6 +476,10 @@ class Connection(object):
         if not self.sock:
             self.log("Send error: missing socket")
             return False
+
+        if not self.connected and message.get("cmd") != "handshake":
+            self.log("Wait for handshake before send request")
+            self.event_connected.get()
 
         try:
             stat_key = message.get("cmd", "unknown")
@@ -418,7 +505,7 @@ class Connection(object):
                 with self.send_lock:
                     self.sock.sendall(data)
         except Exception, err:
-            self.close("Send error: %s" % err)
+            self.close("Send error: %s (cmd: %s)" % (err, stat_key))
             return False
         self.last_sent_time = time.time()
         return True

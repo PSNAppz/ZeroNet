@@ -4,6 +4,7 @@ import shutil
 import json
 import time
 import sys
+from collections import defaultdict
 
 import sqlite3
 import gevent.event
@@ -113,6 +114,7 @@ class SiteStorage(object):
                     time.sleep(0.000001)  # Context switch to avoid UI block
 
     # Rebuild sql cache
+    @util.Noparallel()
     def rebuildDb(self, delete_db=True):
         self.has_db = self.isFile("dbschema.json")
         if not self.has_db:
@@ -368,7 +370,7 @@ class SiteStorage(object):
             inner_path = ""
         else:
             if path.startswith(self.directory):
-                inner_path = path[len(self.directory)+1:]
+                inner_path = path[len(self.directory) + 1:]
             else:
                 raise Exception(u"File not allowed: %s" % path)
         return inner_path
@@ -376,25 +378,32 @@ class SiteStorage(object):
     # Verify all files sha512sum using content.json
     def verifyFiles(self, quick_check=False, add_optional=False, add_changed=True):
         bad_files = []
+        back = defaultdict(int)
+        back["bad_files"] = bad_files
         i = 0
+        self.log.debug("Verifing files...")
 
         if not self.site.content_manager.contents.get("content.json"):  # No content.json, download it first
             self.log.debug("VerifyFile content.json not exists")
             self.site.needFile("content.json", update=True)  # Force update to fix corrupt file
             self.site.content_manager.loadContent()  # Reload content.json
         for content_inner_path, content in self.site.content_manager.contents.items():
+            back["num_content"] += 1
             i += 1
             if i % 50 == 0:
                 time.sleep(0.0001)  # Context switch to avoid gevent hangs
             if not os.path.isfile(self.getPath(content_inner_path)):  # Missing content.json file
+                back["num_content_missing"] += 1
                 self.log.debug("[MISSING] %s" % content_inner_path)
                 bad_files.append(content_inner_path)
 
             for file_relative_path in content.get("files", {}).keys():
+                back["num_file"] += 1
                 file_inner_path = helper.getDirname(content_inner_path) + file_relative_path  # Relative to site dir
                 file_inner_path = file_inner_path.strip("/")  # Strip leading /
                 file_path = self.getPath(file_inner_path)
                 if not os.path.isfile(file_path):
+                    back["num_file_missing"] += 1
                     self.log.debug("[MISSING] %s" % file_inner_path)
                     bad_files.append(file_inner_path)
                     continue
@@ -410,6 +419,7 @@ class SiteStorage(object):
                         ok = False
 
                 if not ok:
+                    back["num_file_invalid"] += 1
                     self.log.debug("[INVALID] %s: %s" % (file_inner_path, err))
                     if add_changed or content.get("cert_user_id"):  # If updating own site only add changed user files
                         bad_files.append(file_inner_path)
@@ -418,13 +428,17 @@ class SiteStorage(object):
             optional_added = 0
             optional_removed = 0
             for file_relative_path in content.get("files_optional", {}).keys():
+                back["num_optional"] += 1
                 file_node = content["files_optional"][file_relative_path]
                 file_inner_path = helper.getDirname(content_inner_path) + file_relative_path  # Relative to site dir
                 file_inner_path = file_inner_path.strip("/")  # Strip leading /
                 file_path = self.getPath(file_inner_path)
+                hash_id = self.site.content_manager.hashfield.getHashId(file_node["sha512"])
                 if not os.path.isfile(file_path):
-                    if self.site.content_manager.hashfield.hasHash(file_node["sha512"]):
-                        self.site.content_manager.optionalRemove(file_inner_path, file_node["sha512"], file_node["size"])
+                    if self.site.content_manager.isDownloaded(file_inner_path, hash_id):
+                        back["num_optional_removed"] += 1
+                        self.log.debug("[OPTIONAL REMOVED] %s" % file_inner_path)
+                        self.site.content_manager.optionalRemoved(file_inner_path, hash_id, file_node["size"])
                     if add_optional:
                         bad_files.append(file_inner_path)
                     continue
@@ -438,12 +452,15 @@ class SiteStorage(object):
                         ok = False
 
                 if ok:
-                    if not self.site.content_manager.hashfield.hasHash(file_node["sha512"]):
-                        self.site.content_manager.optionalDownloaded(file_inner_path, file_node["sha512"], file_node["size"])
+                    if not self.site.content_manager.isDownloaded(file_inner_path, hash_id):
+                        back["num_optional_added"] += 1
+                        self.site.content_manager.optionalDownloaded(file_inner_path, hash_id, file_node["size"])
                         optional_added += 1
+                        self.log.debug("[OPTIONAL FOUND] %s" % file_inner_path)
                 else:
-                    if self.site.content_manager.hashfield.hasHash(file_node["sha512"]):
-                        self.site.content_manager.optionalRemove(file_inner_path, file_node["sha512"], file_node["size"])
+                    if self.site.content_manager.isDownloaded(file_inner_path, hash_id):
+                        back["num_optional_removed"] += 1
+                        self.site.content_manager.optionalRemoved(file_inner_path, hash_id, file_node["size"])
                         optional_removed += 1
                     bad_files.append(file_inner_path)
                     self.log.debug("[OPTIONAL CHANGED] %s" % file_inner_path)
@@ -454,17 +471,19 @@ class SiteStorage(object):
                     (content_inner_path, len(content["files"]), quick_check, optional_added, optional_removed)
                 )
 
+        self.site.content_manager.contents.db.processDelayed()
         time.sleep(0.0001)  # Context switch to avoid gevent hangs
-        return bad_files
+        return back
 
     # Check and try to fix site files integrity
     def updateBadFiles(self, quick_check=True):
         s = time.time()
-        bad_files = self.verifyFiles(
+        res = self.verifyFiles(
             quick_check,
             add_optional=self.site.isDownloadable(""),
             add_changed=not self.site.settings.get("own")  # Don't overwrite changed files if site owned
         )
+        bad_files = res["bad_files"]
         self.site.bad_files = {}
         if bad_files:
             for bad_file in bad_files:
@@ -476,7 +495,7 @@ class SiteStorage(object):
         self.log.debug("Deleting files from content.json...")
         files = []  # Get filenames
         for content_inner_path in self.site.content_manager.contents.keys():
-            content = self.site.content_manager.contents[content_inner_path]
+            content = self.site.content_manager.contents.get(content_inner_path, {})
             files.append(content_inner_path)
             # Add normal files
             for file_relative_path in content.get("files", {}).keys():
@@ -516,10 +535,10 @@ class SiteStorage(object):
             for dir in dirs:
                 path = os.path.join(root, dir)
                 if os.path.isdir(path) and os.listdir(path) == []:
-                    os.removedirs(path)
+                    os.rmdir(path)
                     self.log.debug("Removing %s" % path)
         if os.path.isdir(self.directory) and os.listdir(self.directory) == []:
-            os.removedirs(self.directory)  # Remove sites directory if empty
+            os.rmdir(self.directory)  # Remove sites directory if empty
 
         if os.path.isdir(self.directory):
             self.log.debug("Some unknown file remained in site data dir: %s..." % self.directory)

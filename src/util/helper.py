@@ -209,7 +209,7 @@ def limitedGzipFile(*args, **kwargs):
     import gzip
     class LimitedGzipFile(gzip.GzipFile):
         def read(self, size=-1):
-            return super(LimitedGzipFile, self).read(1024*1024*6)
+            return super(LimitedGzipFile, self).read(1024*1024*25)
     return LimitedGzipFile(*args, **kwargs)
 
 def avg(items):
@@ -217,3 +217,7 @@ def avg(items):
         return sum(items) / len(items)
     else:
         return 0
+
+local_ip_pattern = re.compile(r"^(127\.)|(192\.168\.)|(10\.)|(172\.1[6-9]\.)|(172\.2[0-9]\.)|(172\.3[0-1]\.)|(::1$)|([fF][cCdD])")
+def isPrivateIp(ip):
+    return local_ip_pattern.match(ip)

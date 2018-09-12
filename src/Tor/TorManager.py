@@ -30,11 +30,14 @@ class TorManager(object):
         self.privatekeys = {}  # Onion: Privatekey
         self.site_onions = {}  # Site address: Onion
         self.tor_exe = "tools/tor/tor.exe"
+        self.has_meek_bridges = os.path.isfile("tools/tor/PluggableTransports/meek-client.exe")
         self.tor_process = None
         self.log = logging.getLogger("TorManager")
         self.start_onions = None
         self.conn = None
         self.lock = RLock()
+        self.starting = True
+        self.event_started = gevent.event.AsyncResult()
 
         if config.tor == "disable":
             self.enabled = False
@@ -55,27 +58,32 @@ class TorManager(object):
         self.proxy_ip, self.proxy_port = config.tor_proxy.split(":")
         self.proxy_port = int(self.proxy_port)
 
-        # Test proxy port
-        if config.tor != "disable":
-            try:
-                assert self.connect(), "No connection"
-                self.log.debug("Tor proxy port %s check ok" % config.tor_proxy)
-            except Exception, err:
-                self.log.info("Starting self-bundled Tor, due to Tor proxy port %s check error: %s" % (config.tor_proxy, err))
-                self.enabled = False
-                # Change to self-bundled Tor ports
-                from lib.PySocks import socks
-                self.port = 49051
-                self.proxy_port = 49050
-                socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, "127.0.0.1", self.proxy_port)
-                if os.path.isfile(self.tor_exe):  # Already, downloaded: sync mode
-                    self.startTor()
-                else:  # Not downloaded yet: Async mode
-                    gevent.spawn(self.startTor)
+    def start(self):
+        self.log.debug("Starting (Tor: %s)" % config.tor)
+        self.starting = True
+        try:
+            if not self.connect():
+                raise Exception("No connection")
+            self.log.debug("Tor proxy port %s check ok" % config.tor_proxy)
+        except Exception, err:
+            if sys.platform.startswith("win"):
+                self.log.info(u"Starting self-bundled Tor, due to Tor proxy port %s check error: %s" % (config.tor_proxy, err))
+            else:
+                self.log.info(u"Disabling Tor, because error while accessing Tor proxy at port %s: %s" % (config.tor_proxy, err))
+            self.enabled = False
+            # Change to self-bundled Tor ports
+            from lib.PySocks import socks
+            self.port = 49051
+            self.proxy_port = 49050
+            socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, "127.0.0.1", self.proxy_port)
+            if os.path.isfile(self.tor_exe):  # Already, downloaded: sync mode
+                self.startTor()
+            else:  # Not downloaded yet: Async mode
+                gevent.spawn(self.startTor)
 
     def setStatus(self, status):
         self.status = status
-        if "ui_server" in dir(sys.modules["main"]):
+        if "ui_server" in dir(sys.modules.get("main", {})):
             sys.modules["main"].ui_server.updateWebsocket()
 
     def startTor(self):
@@ -88,23 +96,35 @@ class TorManager(object):
                 tor_dir = os.path.dirname(self.tor_exe)
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                self.tor_process = subprocess.Popen(r"%s -f torrc" % self.tor_exe, cwd=tor_dir, close_fds=True, startupinfo=startupinfo)
-                for wait in range(1,10):  # Wait for startup
+                cmd = r"%s -f torrc --defaults-torrc torrc-defaults --ignore-missing-torrc" % self.tor_exe
+                if config.tor_use_bridges:
+                    cmd += " --UseBridges 1"
+
+                self.tor_process = subprocess.Popen(cmd, cwd=tor_dir, close_fds=True, startupinfo=startupinfo)
+                for wait in range(1, 10):  # Wait for startup
                     time.sleep(wait * 0.5)
                     self.enabled = True
                     if self.connect():
+                        if self.isSubprocessRunning():
+                            self.request("TAKEOWNERSHIP")  # Shut down Tor client when controll connection closed
                         break
                 # Terminate on exit
                 atexit.register(self.stopTor)
             except Exception, err:
-                self.log.error("Error starting Tor client: %s" % Debug.formatException(err))
+                self.log.error(u"Error starting Tor client: %s" % Debug.formatException(str(err).decode("utf8", "ignore")))
                 self.enabled = False
+        self.starting = False
+        self.event_started.set(False)
         return False
+
+    def isSubprocessRunning(self):
+        return self.tor_process and self.tor_process.pid and self.tor_process.poll() is None
 
     def stopTor(self):
         self.log.debug("Stopping...")
         try:
-            self.tor_process.terminate()
+            if self.isSubprocessRunning():
+                self.request("SIGNAL SHUTDOWN")
         except Exception, err:
             self.log.error("Error stopping Tor: %s" % err)
 
@@ -172,12 +192,13 @@ class TorManager(object):
                 # Auth cookie file
                 res_protocol = self.send("PROTOCOLINFO", conn)
                 cookie_match = re.search('COOKIEFILE="(.*?)"', res_protocol)
-                if cookie_match:
+
+                if config.tor_password:
+                    res_auth = self.send('AUTHENTICATE "%s"' % config.tor_password, conn)
+                elif cookie_match:
                     cookie_file = cookie_match.group(1).decode("string-escape")
                     auth_hex = binascii.b2a_hex(open(cookie_file, "rb").read())
                     res_auth = self.send("AUTHENTICATE %s" % auth_hex, conn)
-                elif config.tor_password:
-                    res_auth = self.send('AUTHENTICATE "%s"' % config.tor_password, conn)
                 else:
                     res_auth = self.send("AUTHENTICATE", conn)
 
@@ -189,11 +210,13 @@ class TorManager(object):
                 assert float(version.replace(".", "0", 2)) >= 207.5, "Tor version >=0.2.7.5 required, found: %s" % version
 
                 self.setStatus(u"Connected (%s)" % res_auth)
+                self.event_started.set(True)
+                self.connecting = False
                 self.conn = conn
         except Exception, err:
             self.conn = None
-            self.setStatus(u"Error (%s)" % err)
-            self.log.error("Tor controller connect error: %s" % Debug.formatException(err))
+            self.setStatus(u"Error (%s)" % str(err).decode("utf8", "ignore"))
+            self.log.error(u"Tor controller connect error: %s" % Debug.formatException(str(err).decode("utf8", "ignore")))
             self.enabled = False
         return self.conn
 
@@ -205,6 +228,7 @@ class TorManager(object):
         if self.enabled:
             self.log.debug("Start onions")
             self.start_onions = True
+            self.getOnion("global")
 
     # Get new exit node ip
     def resetCircuits(self):
@@ -215,7 +239,7 @@ class TorManager(object):
 
     def addOnion(self):
         if len(self.privatekeys) >= config.tor_hs_limit:
-            return random.choice(self.privatekeys.keys())
+            return random.choice([key for key in self.privatekeys.keys() if key != self.site_onions.get("global")])
 
         result = self.makeOnionAndKey()
         if result:
@@ -237,7 +261,6 @@ class TorManager(object):
             self.setStatus(u"AddOnion error (%s)" % res)
             self.log.error("Tor addOnion error: %s" % res)
             return False
-
 
     def delOnion(self, address):
         res = self.request("DEL_ONION %s" % address)
@@ -277,7 +300,8 @@ class TorManager(object):
                 time.sleep(1)
                 self.connect()
                 back = None
-        self.log.debug("< %s" % back.strip())
+        if back:
+            self.log.debug("< %s" % back.strip())
         return back
 
     def getPrivatekey(self, address):
@@ -290,7 +314,7 @@ class TorManager(object):
         with self.lock:
             if not self.enabled:
                 return None
-            if self.start_onions:  # Different onion for every site
+            if config.tor == "always":  # Different onion for every site
                 onion = self.site_onions.get(site_address)
             else:  # Same onion for every site
                 onion = self.site_onions.get("global")
@@ -307,6 +331,9 @@ class TorManager(object):
         if not self.enabled:
             return False
         self.log.debug("Creating new Tor socket to %s:%s" % (onion, port))
+        if self.starting:
+            self.log.debug("Waiting for startup...")
+            self.event_started.get()
         if config.tor == "always":  # Every socket is proxied by default, in this mode
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         else:

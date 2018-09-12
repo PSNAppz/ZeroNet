@@ -1,6 +1,5 @@
 import time
 import logging
-import random
 import collections
 
 import gevent
@@ -60,6 +59,7 @@ class WorkerManager(object):
                             worker.skip()
                     else:
                         self.failTask(task)
+
                 elif time.time() >= task["time_added"] + 60 and not self.workers:  # No workers left
                     self.log.debug("Timeout, Cleanup task: %s" % task)
                     # Remove task
@@ -88,7 +88,7 @@ class WorkerManager(object):
                                 # Re-search for high priority
                                 self.startFindOptional(find_more=True)
                         if task["peers"]:
-                            peers_try = [peer for peer in task["peers"] if peer not in task["failed"]]
+                            peers_try = [peer for peer in task["peers"] if peer not in task["failed"] and peer not in workers]
                             if peers_try:
                                 self.startWorkers(peers_try, force_num=5)
                             else:
@@ -174,7 +174,10 @@ class WorkerManager(object):
             return False  # No task for workers
         if len(self.workers) >= self.getMaxWorkers() and not peers:
             return False  # Workers number already maxed and no starting peers defined
-        self.log.debug("Starting workers, tasks: %s, peers: %s, workers: %s" % (len(self.tasks), len(peers or []), len(self.workers)))
+        self.log.debug(
+            "Starting workers, tasks: %s, peers: %s, workers: %s" %
+            (len(self.tasks), len(peers or []), len(self.workers))
+        )
         if not peers:
             peers = self.site.getConnectedPeers()
             if len(peers) < self.getMaxWorkers():
@@ -183,7 +186,7 @@ class WorkerManager(object):
             peers = list(peers)
 
         # Sort by ping
-        peers.sort(key = lambda peer: peer.connection.last_ping_delay if peer.connection and len(peer.connection.waiting_requests) == 0 else 9999)
+        peers.sort(key=lambda peer: peer.connection.last_ping_delay if peer.connection and len(peer.connection.waiting_requests) == 0 and peer.connection.connected else 9999)
 
         for peer in peers:  # One worker for every peer
             if peers and peer not in peers:
@@ -246,7 +249,7 @@ class WorkerManager(object):
             else:
                 continue
             for peer_ip in peer_ips:
-                peer = self.site.addPeer(peer_ip[0], peer_ip[1], return_peer=True)
+                peer = self.site.addPeer(peer_ip[0], peer_ip[1], return_peer=True, source="optional")
                 if not peer:
                     continue
                 if self.taskAddPeer(task, peer):
@@ -309,14 +312,17 @@ class WorkerManager(object):
                 self.startWorkers(found_peers, force_num=3)
 
         if len(found) < len(optional_hash_ids) or find_more:
-            self.log.debug("No connected hashtable result for optional files: %s" % (optional_hash_ids - set(found)))
+            self.log.debug(
+                "No connected hashtable result for optional files: %s (asked: %s)" %
+                (optional_hash_ids - set(found), len(self.asked_peers))
+            )
             if not self.tasks:
                 self.log.debug("No tasks, stopping finding optional peers")
                 return
 
             # Try to query connected peers
             threads = []
-            peers = [peer for peer in self.site.getConnectedPeers() if peer.key not in self.asked_peers]
+            peers = [peer for peer in self.site.getConnectedPeers() if peer.key not in self.asked_peers][0:10]
             if not peers:
                 peers = self.site.getConnectablePeers(ignore=self.asked_peers)
 
@@ -346,7 +352,10 @@ class WorkerManager(object):
                     break
 
         if len(found) < len(optional_hash_ids):
-            self.log.debug("No findHash result, try random peers: %s" % (optional_hash_ids - set(found)))
+            self.log.debug(
+                "No findHash result, try random peers: %s (asked: %s)" %
+                (optional_hash_ids - set(found), len(self.asked_peers))
+            )
             # Try to query random peers
 
             if time_tasks != self.time_task_added:  # New task added since start
@@ -411,7 +420,6 @@ class WorkerManager(object):
             elif self.tasks and not self.workers and worker.task:
                 self.log.debug("Starting new workers... (tasks: %s)" % len(self.tasks))
                 self.startWorkers()
-
 
     # Tasks sorted by this
     def getPriorityBoost(self, inner_path):
@@ -510,7 +518,7 @@ class WorkerManager(object):
     def checkComplete(self):
         time.sleep(0.1)
         if not self.tasks:
-            self.log.debug("Check compelte: No tasks")
+            self.log.debug("Check complete: No tasks")
             self.onComplete()
 
     def onComplete(self):
@@ -523,7 +531,10 @@ class WorkerManager(object):
         task["done"] = True
         self.tasks.remove(task)  # Remove from queue
         if task["optional_hash_id"]:
-            self.log.debug("Downloaded optional file in %.3fs, adding to hashfield: %s" % (time.time() - task["time_started"], task["inner_path"]))
+            self.log.debug(
+                "Downloaded optional file in %.3fs, adding to hashfield: %s" %
+                (time.time() - task["time_started"], task["inner_path"])
+            )
             self.site.content_manager.optionalDownloaded(task["inner_path"], task["optional_hash_id"], task["size"])
         self.site.onFileDone(task["inner_path"])
         task["evt"].set(True)

@@ -3,6 +3,7 @@ import os
 import time
 import json
 import itertools
+import socket
 
 # Third party modules
 import gevent
@@ -62,7 +63,7 @@ class FileRequest(object):
         # Don't allow other sites than locked
         if "site" in params and self.connection.target_onion:
             valid_sites = self.connection.getValidSites()
-            if params["site"] not in valid_sites:
+            if params["site"] not in valid_sites and valid_sites != ["global"]:
                 self.response({"error": "Invalid site"})
                 self.connection.log(
                     "Site lock violation: %s not in %s, target onion: %s" %
@@ -141,7 +142,7 @@ class FileRequest(object):
             site.onFileDone(inner_path)  # Trigger filedone
 
             if inner_path.endswith("content.json"):  # Download every changed file from peer
-                peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True)  # Add or get peer
+                peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True, source="update")  # Add or get peer
                 # On complete publish to other peers
                 diffs = params.get("diffs", {})
                 site.onComplete.once(lambda: site.publish(inner_path=inner_path, diffs=diffs, limit=3), "publish_%s" % inner_path)
@@ -159,7 +160,7 @@ class FileRequest(object):
             self.connection.goodAction()
 
         elif valid is None:  # Not changed
-            peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True)  # Add or get peer
+            peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True, source="update old")  # Add or get peer
             if peer:
                 if not peer.connection:
                     peer.connect(self.connection)  # Assign current connection to peer
@@ -206,13 +207,14 @@ class FileRequest(object):
                 if file_size > read_bytes:  # Check if file is readable at current position (for big files)
                     if not self.isReadable(site, params["inner_path"], file, params["location"]):
                         raise RequestError("File not readable at position: %s" % params["location"])
+                else:
+                    if params.get("file_size") and params["file_size"] != file_size:
+                        self.connection.badAction(2)
+                        raise RequestError("File size does not match: %sB != %sB" % (params["file_size"], file_size))
 
                 if not streaming:
                     file.read_bytes = read_bytes
 
-                if params.get("file_size") and params["file_size"] != file_size:
-                    self.connection.badAction(2)
-                    raise RequestError("File size does not match: %sB != %sB" % (params["file_size"], file_size))
 
                 if params["location"] > file_size:
                     self.connection.badAction(5)
@@ -240,7 +242,7 @@ class FileRequest(object):
                 self.log.debug("File %s at position %s sent %s bytes" % (file_path, params["location"], bytes_sent))
 
             # Add peer to site if not added before
-            connected_peer = site.addPeer(self.connection.ip, self.connection.port)
+            connected_peer = site.addPeer(self.connection.ip, self.connection.port, source="request")
             if connected_peer:  # Just added
                 connected_peer.connect(self.connection)  # Assign current connection to peer
 
@@ -272,7 +274,8 @@ class FileRequest(object):
         added = 0
 
         # Add requester peer to site
-        connected_peer = site.addPeer(self.connection.ip, self.connection.port)
+        connected_peer = site.addPeer(self.connection.ip, self.connection.port, source="request")
+
         if connected_peer:  # It was not registered before
             added += 1
             connected_peer.connect(self.connection)  # Assign current connection to peer
@@ -281,18 +284,18 @@ class FileRequest(object):
         for packed_address in params.get("peers", []):
             address = helper.unpackAddress(packed_address)
             got_peer_keys.append("%s:%s" % address)
-            if site.addPeer(*address):
+            if site.addPeer(*address, source="pex"):
                 added += 1
 
         # Add sent peers to site
         for packed_address in params.get("peers_onion", []):
             address = helper.unpackOnionAddress(packed_address)
             got_peer_keys.append("%s:%s" % address)
-            if site.addPeer(*address):
+            if site.addPeer(*address, source="pex"):
                 added += 1
 
         # Send back peers that is not in the sent list and connectable (not port 0)
-        packed_peers = helper.packPeers(site.getConnectablePeers(params["need"], got_peer_keys))
+        packed_peers = helper.packPeers(site.getConnectablePeers(params["need"], got_peer_keys, allow_private=False))
 
         if added:
             site.worker_manager.onPeers()
@@ -319,7 +322,7 @@ class FileRequest(object):
         modified_files = site.content_manager.listModified(params["since"])
 
         # Add peer to site if not added before
-        connected_peer = site.addPeer(self.connection.ip, self.connection.port)
+        connected_peer = site.addPeer(self.connection.ip, self.connection.port, source="request")
         if connected_peer:  # Just added
             connected_peer.connect(self.connection)  # Assign current connection to peer
 
@@ -331,9 +334,8 @@ class FileRequest(object):
             self.response({"error": "Unknown site"})
             return False
 
-        s = time.time()
         # Add peer to site if not added before
-        peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True)
+        peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True, source="request")
         if not peer.connection:  # Just added
             peer.connect(self.connection)  # Assign current connection to peer
 
@@ -412,31 +414,11 @@ class FileRequest(object):
             return False
 
         # Add or get peer
-        peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True, connection=self.connection)
+        peer = site.addPeer(self.connection.ip, self.connection.port, return_peer=True, connection=self.connection, source="request")
         if not peer.connection:
             peer.connect(self.connection)
         peer.hashfield.replaceFromString(params["hashfield_raw"])
         self.response({"ok": "Updated"})
-
-    def actionSiteReload(self, params):
-        if self.connection.ip not in config.ip_local and self.connection.ip != config.ip_external:
-            self.response({"error": "Only local host allowed"})
-
-        site = self.sites.get(params["site"])
-        site.content_manager.loadContent(params["inner_path"], add_bad_files=False)
-        site.storage.verifyFiles(quick_check=True)
-        site.updateWebsocket()
-
-        self.response({"ok": "Reloaded"})
-
-    def actionSitePublish(self, params):
-        if self.connection.ip not in config.ip_local and self.connection.ip != config.ip_external:
-            self.response({"error": "Only local host allowed"})
-
-        site = self.sites.get(params["site"])
-        num = site.publish(limit=8, inner_path=params.get("inner_path", "content.json"), diffs=params.get("diffs", {}))
-
-        self.response({"ok": "Successfuly published to %s peers" % num})
 
     # Send a simple Pong! answer
     def actionPing(self, params):

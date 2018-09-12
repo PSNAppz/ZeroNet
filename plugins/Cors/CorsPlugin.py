@@ -4,10 +4,9 @@ import copy
 
 from Plugin import PluginManager
 from Translate import Translate
-from util import helper
-from Debug import Debug
 if "_" not in locals():
     _ = Translate("plugins/Cors/languages/")
+
 
 def getCorsPath(site, inner_path):
     match = re.match("^cors-([A-Za-z0-9]{26,35})/(.*)", inner_path)
@@ -24,6 +23,15 @@ def getCorsPath(site, inner_path):
 
 @PluginManager.registerTo("UiWebsocket")
 class UiWebsocketPlugin(object):
+    def hasSitePermission(self, address, cmd=None):
+        if super(UiWebsocketPlugin, self).hasSitePermission(address, cmd=cmd):
+            return True
+
+        if not "Cors:%s" % address in self.site.settings["permissions"] or cmd not in ["fileGet", "fileList", "dirList", "fileRules", "optionalFileInfo", "fileQuery", "dbQuery", "userGetSettings", "siteInfo"]:
+            return False
+        else:
+            return True
+
     # Add cors support for file commands
     def corsFuncWrapper(self, func_name, to, inner_path, *args, **kwargs):
         if inner_path.startswith("cors-"):
@@ -44,6 +52,12 @@ class UiWebsocketPlugin(object):
     def actionFileGet(self, to, inner_path, *args, **kwargs):
         return self.corsFuncWrapper("actionFileGet", to, inner_path, *args, **kwargs)
 
+    def actionFileList(self, to, inner_path, *args, **kwargs):
+        return self.corsFuncWrapper("actionFileList", to, inner_path, *args, **kwargs)
+
+    def actionDirList(self, to, inner_path, *args, **kwargs):
+        return self.corsFuncWrapper("actionDirList", to, inner_path, *args, **kwargs)
+
     def actionFileRules(self, to, inner_path, *args, **kwargs):
         return self.corsFuncWrapper("actionFileRules", to, inner_path, *args, **kwargs)
 
@@ -59,7 +73,7 @@ class UiWebsocketPlugin(object):
             site_name = address
             button_title = _["Grant & Add"]
 
-        if site and "Cors:"+address in self.permissions:
+        if site and "Cors:" + address in self.permissions:
             return "ignored"
 
         self.cmd(
@@ -69,10 +83,11 @@ class UiWebsocketPlugin(object):
         )
 
     def cbCorsPermission(self, to, address):
-        self.actionPermissionAdd(to, "Cors:"+address)
+        self.actionPermissionAdd(to, "Cors:" + address)
         site = self.server.sites.get(address)
         if not site:
             self.server.site_manager.need(address)
+
 
 @PluginManager.registerTo("UiRequest")
 class UiRequestPlugin(object):
